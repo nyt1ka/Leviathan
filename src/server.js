@@ -17,6 +17,7 @@ const {
 
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", 1);
 app.use(helmet());
 app.use(cors({ origin: false }));
 app.use(express.json({ limit: "256kb" }));
@@ -46,7 +47,7 @@ const loginSchema = z.object({
   publicKey: z.string().max(8192).optional()
 });
 
-app.get("/", (_, res) => res.json({ name: "Leviathan API", version: "0.3.0" }));
+app.get("/", (_, res) => res.json({ name: "Leviathan API", version: "0.3.1" }));
 
 app.get("/health", async (_, res) => {
   try {
@@ -57,8 +58,6 @@ app.get("/health", async (_, res) => {
   }
 });
 
-// One-time creation of the first OWNER.
-// Set OWNER_BOOTSTRAP_TOKEN in Railway, use it once, then remove it.
 app.post("/auth/bootstrap-owner", async (req, res) => {
   const token = process.env.OWNER_BOOTSTRAP_TOKEN;
   if (!token) return res.status(404).json({ error: "bootstrap disabled" });
@@ -160,6 +159,19 @@ app.post("/auth/login", async (req, res) => {
     return res.status(403).json({ error: "account not active", status: user.status });
   }
 
+  const existingDevice = await pool.query(
+    "SELECT user_id,revoked_at FROM devices WHERE id=$1",
+    [d.deviceId]
+  );
+
+  if (existingDevice.rowCount && String(existingDevice.rows[0].user_id) !== String(user.id)) {
+    return res.status(409).json({ error: "device belongs to another user" });
+  }
+
+  if (existingDevice.rows[0]?.revoked_at) {
+    return res.status(403).json({ error: "device revoked" });
+  }
+
   await pool.query(
     `INSERT INTO devices(id,user_id,device_name,public_key,last_seen_at)
      VALUES($1,$2,$3,$4,NOW())
@@ -169,9 +181,6 @@ app.post("/auth/login", async (req, res) => {
        last_seen_at=NOW()`,
     [d.deviceId, user.id, d.deviceName, d.publicKey || null]
   );
-
-  const revoked = await pool.query("SELECT revoked_at FROM devices WHERE id=$1", [d.deviceId]);
-  if (revoked.rows[0]?.revoked_at) return res.status(403).json({ error: "device revoked" });
 
   const session = await issueSession(user, d.deviceId);
   res.json({
@@ -205,7 +214,6 @@ app.post("/auth/refresh", async (req, res) => {
     return res.status(401).json({ error: "session unavailable" });
   }
 
-  // Rotate refresh token on every use.
   const newRefresh = crypto.randomBytes(48).toString("base64url");
   const newHash = hashRefreshToken(newRefresh);
   const newExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
@@ -275,12 +283,27 @@ app.post("/admin/users/:id/block", auth, requireRole("OWNER", "ADMIN"), async (r
   if (String(req.params.id) === String(req.auth.sub)) {
     return res.status(400).json({ error: "cannot block yourself" });
   }
+
+  const target = await pool.query("SELECT role FROM users WHERE id=$1", [req.params.id]);
+  if (!target.rowCount) return res.sendStatus(404);
+
+  if (req.auth.role === "ADMIN" && target.rows[0].role !== "USER") {
+    return res.status(403).json({ error: "admin cannot block privileged user" });
+  }
+
   await pool.query("UPDATE users SET status='BLOCKED',updated_at=NOW() WHERE id=$1", [req.params.id]);
   await pool.query("UPDATE sessions SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL", [req.params.id]);
   res.json({ status: "blocked" });
 });
 
 app.post("/admin/users/:id/unblock", auth, requireRole("OWNER", "ADMIN"), async (req, res) => {
+  const target = await pool.query("SELECT role FROM users WHERE id=$1", [req.params.id]);
+  if (!target.rowCount) return res.sendStatus(404);
+
+  if (req.auth.role === "ADMIN" && target.rows[0].role !== "USER") {
+    return res.status(403).json({ error: "admin cannot unblock privileged user" });
+  }
+
   await pool.query("UPDATE users SET status='ACTIVE',updated_at=NOW() WHERE id=$1", [req.params.id]);
   res.json({ status: "active" });
 });
@@ -291,6 +314,7 @@ app.patch("/admin/users/:id/role", auth, requireRole("OWNER"), async (req, res) 
   if (String(req.params.id) === String(req.auth.sub)) {
     return res.status(400).json({ error: "cannot change own owner role" });
   }
+
   const result = await pool.query(
     `UPDATE users SET role=$1,updated_at=NOW() WHERE id=$2
      RETURNING id,username,role`,
@@ -317,20 +341,63 @@ app.post("/devices/:id/revoke", auth, async (req, res) => {
     [req.params.id, req.auth.sub]
   );
   if (!result.rowCount) return res.sendStatus(404);
-  await pool.query("UPDATE sessions SET revoked_at=NOW() WHERE device_id=$1 AND revoked_at IS NULL", [req.params.id]);
+
+  await pool.query(
+    "UPDATE sessions SET revoked_at=NOW() WHERE device_id=$1 AND revoked_at IS NULL",
+    [req.params.id]
+  );
+
   res.json(result.rows[0]);
 });
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
+
 wss.on("connection", ws => {
   ws.send(JSON.stringify({ type: "system", event: "connected" }));
 });
 
+async function recoverOwnerPasswordIfRequested() {
+  const password = process.env.OWNER_RESET_PASSWORD;
+  if (!password) return;
+
+  if (password.length < 10 || password.length > 128) {
+    throw new Error("OWNER_RESET_PASSWORD must be 10-128 characters");
+  }
+
+  const username = String(process.env.OWNER_RESET_USERNAME || "wzrd0us")
+    .trim()
+    .toLowerCase();
+
+  const passwordHash = await hashPassword(password);
+
+  const result = await pool.query(
+    `UPDATE users
+     SET password_hash=$1,status='ACTIVE',updated_at=NOW()
+     WHERE username=$2 AND role='OWNER'
+     RETURNING id,username`,
+    [passwordHash, username]
+  );
+
+  if (result.rowCount !== 1) {
+    throw new Error("OWNER password recovery target not found or ambiguous");
+  }
+
+  await pool.query(
+    "UPDATE sessions SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL",
+    [result.rows[0].id]
+  );
+
+  console.log(`OWNER password recovery applied for ${result.rows[0].username}`);
+}
+
 initDb()
-  .then(() => {
+  .then(async () => {
+    await recoverOwnerPasswordIfRequested();
     const port = Number(process.env.PORT || 3000);
-    server.listen(port, "0.0.0.0", () => console.log(`Leviathan API v0.3.0 listening on ${port}`));
+    server.listen(port, "0.0.0.0", () =>
+      console.log(`Leviathan API v0.3.1 listening on ${port}`)
+    );
   })
   .catch(err => {
     console.error("Database initialization failed:", err.message);
