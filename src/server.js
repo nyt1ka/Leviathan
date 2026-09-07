@@ -47,7 +47,7 @@ const loginSchema = z.object({
   publicKey: z.string().max(8192).optional()
 });
 
-app.get("/", (_, res) => res.json({ name: "Leviathan API", version: "0.3.1" }));
+app.get("/", (_, res) => res.json({ name: "Leviathan API", version: "0.3.2" }));
 
 app.get("/health", async (_, res) => {
   try {
@@ -391,12 +391,33 @@ async function recoverOwnerPasswordIfRequested() {
   console.log(`OWNER password recovery applied for ${result.rows[0].username}`);
 }
 
+async function logRecoveryUsersIfRequested() {
+  if (process.env.OWNER_DIAGNOSTIC_USERS !== "1") return;
+
+  const result = await pool.query(
+    `SELECT username,role,status
+     FROM users
+     ORDER BY created_at ASC`
+  );
+
+  console.log("OWNER_DIAGNOSTIC_USERS_BEGIN");
+  for (const row of result.rows) {
+    console.log(JSON.stringify({
+      username: row.username,
+      role: row.role,
+      status: row.status
+    }));
+  }
+  console.log("OWNER_DIAGNOSTIC_USERS_END");
+}
+
 initDb()
   .then(async () => {
+    await logRecoveryUsersIfRequested();
     await recoverOwnerPasswordIfRequested();
     const port = Number(process.env.PORT || 3000);
     server.listen(port, "0.0.0.0", () =>
-      console.log(`Leviathan API v0.3.1 listening on ${port}`)
+      console.log(`Leviathan API v0.3.2 listening on ${port}`)
     );
   })
   .catch(err => {
