@@ -7,12 +7,12 @@ const helmet = require("helmet");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const { z } = require("zod");
-const { WebSocketServer } = require("ws");
+const { WebSocketServer, WebSocket } = require("ws");
 
 const { pool, initDb } = require("./db");
 const {
   auth, requireRole, issueSession, hashPassword, verifyPassword,
-  hashRefreshToken, signAccessToken
+  hashRefreshToken, signAccessToken, verifyAccessToken, resolveActiveIdentity
 } = require("./auth");
 
 const app = express();
@@ -47,7 +47,26 @@ const loginSchema = z.object({
   publicKey: z.string().max(8192).optional()
 });
 
-app.get("/", (_, res) => res.json({ name: "Leviathan API", version: "0.3.3" }));
+const chatSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("DIRECT"),
+    memberIds: z.array(z.coerce.number().int().positive()).length(1)
+  }),
+  z.object({
+    type: z.literal("GROUP"),
+    title: z.string().trim().min(2).max(128),
+    memberIds: z.array(z.coerce.number().int().positive()).min(1).max(29)
+  })
+]);
+
+const messageSchema = z.object({
+  clientMessageId: z.string().uuid(),
+  algorithm: z.string().trim().min(3).max(64),
+  nonce: z.string().min(8).max(1024),
+  ciphertext: z.string().min(1).max(131072)
+});
+
+app.get("/", (_, res) => res.json({ name: "Leviathan API", version: "0.4.0" }));
 
 app.get("/health", async (_, res) => {
   try {
@@ -350,11 +369,257 @@ app.post("/devices/:id/revoke", auth, async (req, res) => {
   res.json(result.rows[0]);
 });
 
+async function isChatMember(chatId, userId) {
+  const result = await pool.query(
+    `SELECT 1 FROM chat_members
+     WHERE chat_id=$1 AND user_id=$2 AND left_at IS NULL`,
+    [chatId, userId]
+  );
+  return result.rowCount > 0;
+}
+
+app.post("/chats", auth, async (req, res) => {
+  const parsed = chatSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid input" });
+
+  const d = parsed.data;
+  const memberIds = [...new Set(d.memberIds.map(String))]
+    .filter(id => id !== String(req.auth.sub));
+
+  if (d.type === "DIRECT" && memberIds.length !== 1) {
+    return res.status(400).json({ error: "direct chat requires one other member" });
+  }
+
+  const activeUsers = await pool.query(
+    `SELECT id FROM users
+     WHERE id = ANY($1::bigint[]) AND status='ACTIVE'`,
+    [memberIds]
+  );
+  if (activeUsers.rowCount !== memberIds.length) {
+    return res.status(400).json({ error: "all members must be active users" });
+  }
+
+  if (d.type === "DIRECT") {
+    const existing = await pool.query(
+      `SELECT c.id,c.type,c.title,c.created_at
+       FROM chats c
+       JOIN chat_members self_m ON self_m.chat_id=c.id
+         AND self_m.user_id=$1 AND self_m.left_at IS NULL
+       JOIN chat_members other_m ON other_m.chat_id=c.id
+         AND other_m.user_id=$2 AND other_m.left_at IS NULL
+       WHERE c.type='DIRECT'
+         AND (SELECT COUNT(*) FROM chat_members cm
+              WHERE cm.chat_id=c.id AND cm.left_at IS NULL)=2
+       LIMIT 1`,
+      [req.auth.sub, memberIds[0]]
+    );
+    if (existing.rowCount) return res.json(existing.rows[0]);
+  }
+
+  const chatId = crypto.randomUUID();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const chatResult = await client.query(
+      `INSERT INTO chats(id,type,title,created_by)
+       VALUES($1,$2,$3,$4)
+       RETURNING id,type,title,created_by,created_at`,
+      [chatId, d.type, d.type === "GROUP" ? d.title : null, req.auth.sub]
+    );
+    await client.query(
+      `INSERT INTO chat_members(chat_id,user_id,member_role)
+       VALUES($1,$2,'OWNER')`,
+      [chatId, req.auth.sub]
+    );
+    for (const memberId of memberIds) {
+      await client.query(
+        `INSERT INTO chat_members(chat_id,user_id,member_role)
+         VALUES($1,$2,'MEMBER')`,
+        [chatId, memberId]
+      );
+    }
+    await client.query("COMMIT");
+    res.status(201).json(chatResult.rows[0]);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Create chat failed:", err.message);
+    res.status(500).json({ error: "chat creation failed" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/chats", auth, async (req, res) => {
+  const result = await pool.query(
+    `SELECT c.id,c.type,c.title,c.created_by,c.created_at,c.updated_at,
+            COALESCE(
+              json_agg(
+                json_build_object(
+                  'id',u.id,'username',u.username,'displayName',u.display_name,
+                  'memberRole',cm.member_role
+                )
+                ORDER BY u.id
+              ) FILTER (WHERE u.id IS NOT NULL),
+              '[]'::json
+            ) AS members
+     FROM chats c
+     JOIN chat_members mine ON mine.chat_id=c.id
+       AND mine.user_id=$1 AND mine.left_at IS NULL
+     JOIN chat_members cm ON cm.chat_id=c.id AND cm.left_at IS NULL
+     JOIN users u ON u.id=cm.user_id
+     GROUP BY c.id
+     ORDER BY c.updated_at DESC`,
+    [req.auth.sub]
+  );
+  res.json(result.rows);
+});
+
+app.get("/chats/:id/messages", auth, async (req, res) => {
+  if (!(await isChatMember(req.params.id, req.auth.sub))) {
+    return res.status(404).json({ error: "chat not found" });
+  }
+
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
+  const before = req.query.before ? new Date(String(req.query.before)) : null;
+  if (before && Number.isNaN(before.getTime())) {
+    return res.status(400).json({ error: "invalid before timestamp" });
+  }
+
+  const result = await pool.query(
+    `SELECT id,chat_id,sender_user_id,sender_device_id,client_message_id,
+            algorithm,nonce,ciphertext,created_at
+     FROM messages
+     WHERE chat_id=$1 AND ($2::timestamptz IS NULL OR created_at < $2)
+     ORDER BY created_at DESC
+     LIMIT $3`,
+    [req.params.id, before ? before.toISOString() : null, limit]
+  );
+  res.json(result.rows);
+});
+
+app.post("/chats/:id/messages", auth, async (req, res) => {
+  if (!(await isChatMember(req.params.id, req.auth.sub))) {
+    return res.status(404).json({ error: "chat not found" });
+  }
+
+  const parsed = messageSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid input" });
+  const d = parsed.data;
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO messages(
+         id,chat_id,sender_user_id,sender_device_id,client_message_id,
+         algorithm,nonce,ciphertext
+       )
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING id,chat_id,sender_user_id,sender_device_id,client_message_id,
+                 algorithm,nonce,ciphertext,created_at`,
+      [
+        crypto.randomUUID(), req.params.id, req.auth.sub, req.auth.deviceId,
+        d.clientMessageId, d.algorithm, d.nonce, d.ciphertext
+      ]
+    );
+    await pool.query("UPDATE chats SET updated_at=NOW() WHERE id=$1", [req.params.id]);
+    const message = result.rows[0];
+    await broadcastToChat(req.params.id, {
+      type: "message.created",
+      message
+    });
+    res.status(201).json(message);
+  } catch (err) {
+    if (err.code === "23505") {
+      const existing = await pool.query(
+        `SELECT id,chat_id,sender_user_id,sender_device_id,client_message_id,
+                algorithm,nonce,ciphertext,created_at
+         FROM messages
+         WHERE sender_device_id=$1 AND client_message_id=$2`,
+        [req.auth.deviceId, d.clientMessageId]
+      );
+      return res.json(existing.rows[0]);
+    }
+    console.error("Create message failed:", err.message);
+    res.status(500).json({ error: "message creation failed" });
+  }
+});
+
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({ noServer: true });
+const sockets = new Set();
+
+async function broadcastToChat(chatId, payload) {
+  const memberResult = await pool.query(
+    `SELECT user_id FROM chat_members
+     WHERE chat_id=$1 AND left_at IS NULL`,
+    [chatId]
+  );
+  const members = new Set(memberResult.rows.map(row => String(row.user_id)));
+  const data = JSON.stringify(payload);
+
+  for (const ws of sockets) {
+    if (ws.readyState === WebSocket.OPEN && members.has(String(ws.identity?.sub))) {
+      ws.send(data);
+    }
+  }
+}
+
+server.on("upgrade", async (request, socket, head) => {
+  try {
+    const url = new URL(request.url, "http://localhost");
+    if (url.pathname !== "/ws") {
+      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    const header = request.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+    if (!token) throw new Error("missing token");
+
+    const payload = verifyAccessToken(token);
+    const identity = await resolveActiveIdentity(payload);
+    if (!identity) throw new Error("inactive identity");
+
+    wss.handleUpgrade(request, socket, head, ws => {
+      ws.identity = identity;
+      wss.emit("connection", ws, request);
+    });
+  } catch {
+    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    socket.destroy();
+  }
+});
 
 wss.on("connection", ws => {
-  ws.send(JSON.stringify({ type: "system", event: "connected" }));
+  sockets.add(ws);
+  ws.send(JSON.stringify({
+    type: "system",
+    event: "connected",
+    userId: ws.identity.sub,
+    deviceId: ws.identity.deviceId
+  }));
+
+  ws.on("message", raw => {
+    if (raw.length > 4096) {
+      ws.close(1009, "message too large");
+      return;
+    }
+    let event;
+    try {
+      event = JSON.parse(raw.toString());
+    } catch {
+      ws.send(JSON.stringify({ type: "error", error: "invalid json" }));
+      return;
+    }
+    if (event?.type === "ping") {
+      ws.send(JSON.stringify({ type: "pong", at: new Date().toISOString() }));
+      return;
+    }
+    ws.send(JSON.stringify({ type: "error", error: "unsupported websocket event" }));
+  });
+
+  ws.on("close", () => sockets.delete(ws));
+  ws.on("error", () => sockets.delete(ws));
 });
 
 async function initializeOwnerIfRequested() {
@@ -416,7 +681,7 @@ initDb()
     await initializeOwnerIfRequested();
     const port = Number(process.env.PORT || 3000);
     server.listen(port, "0.0.0.0", () =>
-      console.log(`Leviathan API v0.3.3 listening on ${port}`)
+      console.log(`Leviathan API v0.4.0 listening on ${port}`)
     );
   })
   .catch(err => {
