@@ -47,7 +47,7 @@ const loginSchema = z.object({
   publicKey: z.string().max(8192).optional()
 });
 
-app.get("/", (_, res) => res.json({ name: "Leviathan API", version: "0.3.2" }));
+app.get("/", (_, res) => res.json({ name: "Leviathan API", version: "0.3.3" }));
 
 app.get("/health", async (_, res) => {
   try {
@@ -357,67 +357,66 @@ wss.on("connection", ws => {
   ws.send(JSON.stringify({ type: "system", event: "connected" }));
 });
 
-async function recoverOwnerPasswordIfRequested() {
-  const password = process.env.OWNER_RESET_PASSWORD;
-  if (!password) return;
+async function initializeOwnerIfRequested() {
+  if (process.env.OWNER_INIT_ONCE !== "1") return;
 
+  const password = process.env.OWNER_INIT_PASSWORD;
+  if (!password) {
+    throw new Error("OWNER_INIT_PASSWORD is required when OWNER_INIT_ONCE=1");
+  }
   if (password.length < 10 || password.length > 128) {
-    throw new Error("OWNER_RESET_PASSWORD must be 10-128 characters");
+    throw new Error("OWNER_INIT_PASSWORD must be 10-128 characters");
   }
 
-  const username = String(process.env.OWNER_RESET_USERNAME || "wzrd0us")
+  const username = String(process.env.OWNER_INIT_USERNAME || "wzrd0us")
     .trim()
     .toLowerCase();
+  const displayName = String(process.env.OWNER_INIT_DISPLAY_NAME || "Owner").trim();
+
+  if (!/^[a-zA-Z0-9._-]{3,64}$/.test(username)) {
+    throw new Error("OWNER_INIT_USERNAME is invalid");
+  }
+  if (displayName.length < 2 || displayName.length > 128) {
+    throw new Error("OWNER_INIT_DISPLAY_NAME must be 2-128 characters");
+  }
 
   const passwordHash = await hashPassword(password);
+  const client = await pool.connect();
 
-  const result = await pool.query(
-    `UPDATE users
-     SET password_hash=$1,status='ACTIVE',updated_at=NOW()
-     WHERE username=$2 AND role='OWNER'
-     RETURNING id,username`,
-    [passwordHash, username]
-  );
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('leviathan-owner-init'))");
 
-  if (result.rowCount !== 1) {
-    throw new Error("OWNER password recovery target not found or ambiguous");
+    const count = await client.query("SELECT COUNT(*)::int AS n FROM users");
+    if (count.rows[0].n !== 0) {
+      await client.query("COMMIT");
+      console.log("OWNER initialization skipped: users table is not empty");
+      return;
+    }
+
+    const result = await client.query(
+      `INSERT INTO users(username,display_name,password_hash,role,status)
+       VALUES($1,$2,$3,'OWNER','ACTIVE')
+       RETURNING username,role,status`,
+      [username, displayName, passwordHash]
+    );
+
+    await client.query("COMMIT");
+    console.log(`OWNER initialization created: ${result.rows[0].username}`);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
   }
-
-  await pool.query(
-    "UPDATE sessions SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL",
-    [result.rows[0].id]
-  );
-
-  console.log(`OWNER password recovery applied for ${result.rows[0].username}`);
-}
-
-async function logRecoveryUsersIfRequested() {
-  if (process.env.OWNER_DIAGNOSTIC_USERS !== "1") return;
-
-  const result = await pool.query(
-    `SELECT username,role,status
-     FROM users
-     ORDER BY created_at ASC`
-  );
-
-  console.log("OWNER_DIAGNOSTIC_USERS_BEGIN");
-  for (const row of result.rows) {
-    console.log(JSON.stringify({
-      username: row.username,
-      role: row.role,
-      status: row.status
-    }));
-  }
-  console.log("OWNER_DIAGNOSTIC_USERS_END");
 }
 
 initDb()
   .then(async () => {
-    await logRecoveryUsersIfRequested();
-    await recoverOwnerPasswordIfRequested();
+    await initializeOwnerIfRequested();
     const port = Number(process.env.PORT || 3000);
     server.listen(port, "0.0.0.0", () =>
-      console.log(`Leviathan API v0.3.2 listening on ${port}`)
+      console.log(`Leviathan API v0.3.3 listening on ${port}`)
     );
   })
   .catch(err => {
