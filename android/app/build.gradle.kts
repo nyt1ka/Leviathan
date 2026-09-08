@@ -27,9 +27,10 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
+    isCoreLibraryDesugaringEnabled = true
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
 
     packaging {
         resources.excludes += setOf("META-INF/AL2.0", "META-INF/LGPL2.1")
@@ -48,9 +49,10 @@ dependencies {
 
     implementation("com.squareup.okhttp3:okhttp:5.1.0")
 
-    // Signal Protocol native/runtime libraries. Integration lands in the next crypto step.
     implementation("org.signal:libsignal-client:0.102.0")
     implementation("org.signal:libsignal-android:0.102.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 }
