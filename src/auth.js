@@ -16,6 +16,13 @@ function signAccessToken(user, deviceId) {
   );
 }
 
+function verifyAccessToken(token) {
+  return jwt.verify(token, JWT_SECRET, {
+    issuer: "leviathan-api",
+    audience: "leviathan-android"
+  });
+}
+
 function randomRefreshToken() {
   return crypto.randomBytes(48).toString("base64url");
 }
@@ -51,16 +58,37 @@ async function verifyPassword(password, hash) {
   return bcrypt.compare(password, hash);
 }
 
-function auth(req, res, next) {
+async function resolveActiveIdentity(payload) {
+  const result = await pool.query(
+    `SELECT u.id,u.role,u.status,d.id AS device_id,d.revoked_at
+     FROM users u
+     JOIN devices d ON d.user_id=u.id AND d.id=$2
+     WHERE u.id=$1`,
+    [payload.sub, payload.deviceId]
+  );
+
+  if (!result.rowCount) return null;
+  const row = result.rows[0];
+  if (row.status !== "ACTIVE" || row.revoked_at) return null;
+
+  return {
+    ...payload,
+    sub: String(row.id),
+    role: row.role,
+    deviceId: String(row.device_id)
+  };
+}
+
+async function auth(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "unauthorized" });
 
   try {
-    req.auth = jwt.verify(token, JWT_SECRET, {
-      issuer: "leviathan-api",
-      audience: "leviathan-android"
-    });
+    const payload = verifyAccessToken(token);
+    const identity = await resolveActiveIdentity(payload);
+    if (!identity) return res.status(401).json({ error: "unauthorized" });
+    req.auth = identity;
     next();
   } catch {
     return res.status(401).json({ error: "unauthorized" });
@@ -78,5 +106,5 @@ function requireRole(...roles) {
 
 module.exports = {
   auth, requireRole, issueSession, hashPassword, verifyPassword,
-  hashRefreshToken, signAccessToken
+  hashRefreshToken, signAccessToken, verifyAccessToken, resolveActiveIdentity
 };
